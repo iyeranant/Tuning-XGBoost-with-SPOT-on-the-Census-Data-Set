@@ -1,0 +1,356 @@
+---
+title: "DDMO Project"
+author: "Group 2"
+date: "08/03/2021"
+output: html_document
+version: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Important settings:
+
+```{r}
+Sys.setenv("CUDA_VISIBLE_DEVICES" = -1)
+# Number of loops
+maxi=1 # if max time budget is used, should be =1
+
+# File name where to save and load the results
+filename<-'results/00X1234.Rdata'
+
+# Budget for tuning in seconds (max 15*3600)
+timebudget <- 15*3600 
+```
+
+
+Now, you can proceed Part 1 to conduct experiments, or start from Part 2 to proceed Rdata file (line 207). 
+
+-----------------------------------------------------
+# Part 1. Conduct the experiment
+-----------------------------------------------------
+
+Data Set: the Census-Income (KDD) Data Set
+```{r}
+## devtools::install_gitlab("bartz/spot",host="http://owos.gm.fh-koeln.de:8055")
+
+library("OpenML")
+library("mlr")
+library("plotly")
+library("SPOT")
+library("farff")
+
+if (packageVersion("SPOT") < "2.4.8") message("Please update 'SPOT'")
+
+dirName= "oml.cache"
+if (! (dir.exists(dirName))) dir.create(dirName)
+setOMLConfig(apikey = "c1994bdb7ecb3c6f3c8f3b35f4b47f1f",
+              cachedir = dirName # default cachedir is only temporary.
+ )
+ dataOML <- getOMLDataSet(4535)$data
+ 
+ # Different input data
+ #newdataOML<-dataOML[20001:299285,] 
+ #dataOML<-newdataOML
+ 
+ task <- makeClassifTask(data=dataOML,target="V42")
+ 
+ rsmpl <- makeResampleDesc("Holdout", split=0.6)
+```
+
+Project Setup
+```{r}
+task.type <- "classif"
+data.seed <- 1
+tuner.seed <- 1
+timeout <- timebudget/20 # use 1/20 times the budget before tuning is stopped
+```
+
+Learner (Algorithm) Definition
+```{r}
+model <- "xgboost"
+learner <- paste(task.type, model, sep=".")
+```
+
+Experiment Configuration
+```{r}
+if(model=="xgboost"){
+   tunepars <- c("nrounds","eta","lambda","alpha","subsample","colsample_bytree","gamma","max_depth","min_child_weight")
+   lower <- c( 1,  0.4,  -4, -4,  0.8,   0.2,  -4,   3,  -4)
+   upper <- c(200,   1,   9,  7,    1,   0.8,   4,  15,   7)
+   type <-  c("integer","numeric","numeric","numeric","numeric","numeric","numeric","integer","numeric")
+   if(task.type=="classif"){
+      fixpars <- list(eval_metric="logloss",# suppress warning given when default metric is used.
+                      nthread=1) #one thread, not parallel
+      }else{
+         fixpars <- list(eval_metric="rmse",# suppress warning given when default metric is used.
+                         nthread=1) #one thread, not parallel
+         }
+   factorlevels <- list()
+   transformations <- c(trans_id, trans_id, trans_2pow, trans_2pow, trans_id, trans_id, trans_2pow, trans_id, trans_2pow)
+   dummy=TRUE
+   relpars <- list()
+   }
+```
+
+Input missing values
+```{r}
+task <- impute(
+  task,
+  classes = list(
+    factor = imputeMode(),
+    integer = imputeMedian(),
+    numeric = imputeMean()
+    )
+  )$task
+```
+
+Replace all factor features with their dummy variables. Internally model.matrix is used. Non factor
+features will be left untouched and passed to the result.
+```{r}
+if(dummy){
+  task <- createDummyFeatures(task)
+}
+# str(task)
+```
+
+Set Seed
+```{r}
+set.seed(data.seed)
+```
+
+Compile the information as a list.
+```{r}
+cfg <- list(
+ learner=learner,
+   tunepars=tunepars,
+   lower=lower,
+   upper=upper,
+   type=type,
+   fixpars=fixpars,
+   factorlevels=factorlevels,
+   transformations=transformations,
+   dummy=dummy,
+   relpars=relpars,
+   task=task,
+   resample = rsmpl
+)
+```
+
+Get objective function
+```{r}
+objf <- get_objf(config=cfg, timeout=timeout)
+```
+
+Launch SPOT in loops
+*maxi* represents number of loops (is assigned at the beginning)
+
+```{r}
+#initialize result vectors
+ybest_list<- NULL
+xbest_list<- list(NULL)
+result_list<- list(NULL)
+
+for (index in 1:maxi) {
+   ybest_list[index] <- NULL
+   xbest_list[index] <- list(NULL)
+   result_list[index]<- list(NULL)
+}
+
+for (index in 1:maxi) {
+   # Your Tuning Run with SPOT
+   set.seed(2*index)  # seed is changed
+   result <- spot(fun = objf,
+                 lower=cfg$lower,
+                 upper=cfg$upper,
+                 control = list(types=cfg$type,
+                                maxTime = timebudget/60, #convert to minutes
+                                plots=TRUE,
+                                progress = TRUE,
+                                model=buildKriging,
+                                optimizer=optimDE,
+                                noise=TRUE,
+                                seedFun=index, # seed is changed  
+                                seedSPOT=tuner.seed+index, # seed is changed 
+                                designControl=list(size=5*length(cfg$lower)),
+                                funEvals=Inf,
+                                modelControl=list(target="y",
+                                                  useLambda=TRUE,
+                                                  reinterpolate=TRUE),
+                                optimizerControl=list(funEvals=100*length(cfg$lower))
+                 )
+   )
+   ybest_list[index]<-result$ybest
+   xbest_list[[index]]<-result$xbest
+   result_list[[index]]<-result
+}
+```
+
+Save result of experiment
+```{r}
+save(result_list, file=filename)
+```
+
+Save the input of experiment (all configurations).
+It will be saved in the same folder as specified at the beginning.
+```{r}
+input<-list(task.type, data.seed, tuner.seed,timebudget,timeout,model,learner,lower,upper,type,fixpars,factorlevels,transformations,dummy,relpars)
+
+names(input)<-c('task.type','data.seed','tuner.seed','timebudget','timeout','model','learner','lower','upper','type','fixpars','factorlevels','transformations','dummy','relpars')
+
+save(input, file=paste(dirname(filename),'/input_',basename(filename),sep=''))
+```
+
+-----------------------------------------------------
+# Part 2. Data analyzation
+-----------------------------------------------------
+
+Load result
+```{r}
+load(filename)
+```
+
+It is possible to check some experiment configuration in input_file
+```{r}
+load(paste(dirname(filename),'/input_',basename(filename),sep=''))
+
+# For example, time budget
+input$timebudget
+```
+If the experiment have not conducted in current session (you have directly loaded the R.data file), please, proceed the next chunk. 
+```{r}
+# Load libraries
+library("plotly")
+library("SPOT")
+
+maxi<-length(result_list)
+
+# Initialize empty lists
+ybest_list<- NULL
+xbest_list<- list(NULL)
+
+for (index in 1:maxi) {
+   ybest_list[index] <- NULL
+   xbest_list[index] <- list(NULL)
+}
+
+for (index in 1:maxi) {
+   ybest_list[index]<-result_list[[index]]$ybest
+   xbest_list[[index]]<-result_list[[index]]$xbest
+}
+```
+
+Object function results were found
+```{r}
+ybest_list
+```
+
+Hyperparamters that were found
+```{r}
+xbest_list
+```
+
+Make a list for each hyperparameter (separate list for each hyperparameter)
+
+```{r}
+nrounds_list<- NULL
+eta_list<- NULL
+lambda_list<- NULL
+alpha_list<- NULL
+subsample_list<- NULL
+colsample_bytree_list<- NULL
+gamma_list<- NULL
+max_depth_list<- NULL
+min_child_weight_list<- NULL
+
+for (index in 1:maxi) {
+   nrounds_list[index] <- xbest_list[[index]][1]
+   eta_list[index] <- xbest_list[[index]][2]
+   lambda_list[index] <- xbest_list[[index]][3]
+   alpha_list[index] <- xbest_list[[index]][4]
+   subsample_list[index] <- xbest_list[[index]][5]
+   colsample_bytree_list[index] <- xbest_list[[index]][6]
+   gamma_list[index] <- xbest_list[[index]][7]
+   max_depth_list[index] <- xbest_list[[index]][8]
+   min_child_weight_list[index] <- xbest_list[[index]][9]
+}
+
+# Now we have a list, that containts results of hyperparameter from all experiments
+nrounds_list
+```
+
+Parallel plot for single experiment
+
+```{r}
+# Choose the number of experiment: from 1 to maxi
+experiment_num=1
+
+plot_parallel(result_list[[experiment_num]], yvar = 1, xlab = c("nrounds","eta","lambda","alpha","subsample","colsample_bytree","gamma","max_depth","min_child_weight"))
+```
+```{r, eval=FALSE}
+plot_parallel(result_list[[1]], yvar = 1, xlab = c("nrounds","eta","lambda","alpha","subsample","colsample_bytree","gamma","max_depth","min_child_weight"))
+plot_parallel(result_list[[2]], yvar = 1, xlab = c("nrounds","eta","lambda","alpha","subsample","colsample_bytree","gamma","max_depth","min_child_weight"))
+plot_parallel(result_list[[3]], yvar = 1, xlab = c("nrounds","eta","lambda","alpha","subsample","colsample_bytree","gamma","max_depth","min_child_weight"))
+plot_parallel(result_list[[4]], yvar = 1, xlab = c("nrounds","eta","lambda","alpha","subsample","colsample_bytree","gamma","max_depth","min_child_weight"))
+plot_parallel(result_list[[5]], yvar = 1, xlab = c("nrounds","eta","lambda","alpha","subsample","colsample_bytree","gamma","max_depth","min_child_weight"))
+```
+
+
+
+
+Plot surface
+-> Experiment number can be changed
+-> Hyperparameters combination can be changed
+
+```{r}
+# Change the number of experiment: from 1 to maxi
+experiment_num=1
+
+# Make plots
+p1<-plot_surface(result_list[[experiment_num]], which=c(1,2), yvar=1, ylab = "nrounds - eta")
+p2<-plot_surface(result_list[[experiment_num]], which=c(3,4), yvar=1, ylab = "lambda - alpha")
+p3<-plot_surface(result_list[[experiment_num]], which=c(5,6), yvar=1, ylab ="subsample - colsample_bytree")
+p4<-plot_surface(result_list[[experiment_num]], which=c(7,8), yvar=1, ylab ="gamma - max_depth")
+p5<-plot_surface(result_list[[experiment_num]], which=c(8,9), yvar=1,  ylab = "max_depth - min_child_weight")
+
+# Title string
+plot_title<-paste('Experiment no. ',toString(experiment_num),' / ',toString(maxi),' from file: ',basename(filename))
+
+# Merge several plots
+fig <- subplot(p1, p2,p3,p4, nrows=2)
+fig <- fig %>% layout(
+    title = plot_title)
+fig
+
+# Make single plot
+plot_surface(result_list[[experiment_num]], which=c(1,2), yvar=1, ylab = plot_title, xlab=c('nrounds','eta'))
+```
+
+Create Scatterplot matrices. It is like 'pairs', but interactive. We can use options "Box select" or "Lasso select" to highlight specific points.
+[https://plotly-r.com/arranging-views.html#arranging-plotly-objects]
+
+```{r}
+# Create data frame
+df<-do.call(rbind, Map(data.frame, 
+                       nrounds=nrounds_list, 
+                       eta=eta_list, 
+                       lambda=lambda_list,
+                       alpha=alpha_list,
+                       # subsample=subsample_list,
+                       # colsample_bytree=colsample_bytree_list,
+                       # gamma=gamma_list,
+                       # max_depth=max_depth_list,
+                       min_child_weight=min_child_weight_list,
+                       ybest=ybest_list))
+
+# Crate interactive plots
+
+dims <- dplyr::select_if(df, is.numeric)
+dims <- purrr::map2(dims, names(dims), ~list(values=.x, label=.y))
+plot_ly(
+  type = "splom", dimensions = setNames(dims, NULL),
+  showupperhalf = FALSE, diagonal = list(visible = FALSE)
+)
+```
+
